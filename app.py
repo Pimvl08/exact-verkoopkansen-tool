@@ -593,6 +593,9 @@ el => {
 }
 """
 
+# Labels van het titelveld in Exact, in volgorde van voorkeur
+TITEL_LABELS = ['Omschrijving', 'Naam verkoopkans', 'Onderwerp', 'Naam']
+
 # Verzamelt zichtbare foutmeldingen op de pagina.
 JS_FOUTEN = r"""
 () => {
@@ -806,15 +809,48 @@ async def run_batch(ctx, hoofd, cmd):
 
     # ── velden ───────────────────────────────────────────────────────────
     async def veld(frame, labels, mark, fallback_index=None):
-        try:
-            if await frame.evaluate(JS_ZOEK_VELD, [[l.lower() for l in labels], mark]):
-                return frame.locator(f'[data-evt="{mark}"]').first
-        except: pass
+        for label in labels:      # in volgorde van voorkeur: 'Omschrijving' gaat vóór 'Naam'
+            try:
+                if await frame.evaluate(JS_ZOEK_VELD, [[label.lower()], mark]):
+                    return frame.locator(f'[data-evt="{mark}"]').first
+            except: pass
         if fallback_index is not None:
             loc = frame.locator('input[type="text"]:visible')
             if await loc.count() > fallback_index:
                 return loc.nth(fallback_index)
         return None
+
+    titel_info = {'gelogd': False}
+
+    async def zet_titel(ff, bedrijf, controle=False):
+        el = await veld(ff, TITEL_LABELS, 'oms', 0)
+        if not el:
+            log(f'  {bedrijf["naam"]}: FOUT veld voor de titel (Omschrijving) niet gevonden')
+            return False
+        if not titel_info['gelogd']:
+            titel_info['gelogd'] = True
+            try:
+                info = await el.evaluate("el => (el.id || el.name || '?') + ' (huidige waarde: ' + JSON.stringify(el.value) + ')'")
+                log(f'  Titel wordt ingevuld in veld: {info}')
+            except: pass
+        for poging in range(3):
+            try:
+                if (await el.input_value()).strip() == titel:
+                    return True
+            except: pass
+            if controle:
+                log(f'  {bedrijf["naam"]}: titel was overschreven door Exact, opnieuw ingevuld')
+            await el.click()
+            await el.fill('')
+            await el.press_sequentially(titel, delay=5)
+            await el.dispatch_event('change')
+            await el.press('Tab')
+            await asyncio.sleep(0.4)
+            controle = True
+        ok = (await el.input_value()).strip() == titel
+        if not ok:
+            log(f'  {bedrijf["naam"]}: FOUT titel blijft "{await el.input_value()}" i.p.v. "{titel}"')
+        return ok
 
     async def zoek_opslaan(page, form_frame):
         frames = [form_frame] + [f for f in page.frames if f is not form_frame]
@@ -866,10 +902,10 @@ async def run_batch(ctx, hoofd, cmd):
             await screenshot(page, bedrijf['naam']); return False
         await wacht_op_laden(ff, 8000)
 
-        # 1. Omschrijving
-        el = await veld(ff, ['Omschrijving', 'Naam'], 'oms', 0)
-        if el: await el.fill(titel)
-        else:  log(f'  {bedrijf["naam"]}: WAARSCHUWING veld Omschrijving niet gevonden')
+        # 1. Omschrijving (titel). Exact zet hier soms zelf nog een nummer in nadat het
+        #    formulier geladen is; daarom wordt de titel vlak voor Opslaan nogmaals gecontroleerd.
+        await asyncio.sleep(0.5)
+        await zet_titel(ff, bedrijf)
 
         # 2. Fase (bijv. VB). GEEN Enter: dat verstuurt het formulier voordat de fase herkend is.
         el = await veld(ff, ['Fase', 'Verkoopkans fase', 'Verkoopkansfase'], 'fase', 1)
@@ -920,7 +956,9 @@ async def run_batch(ctx, hoofd, cmd):
             await ta.dispatch_event('change')
         else: log(f'  {bedrijf["naam"]}: WAARSCHUWING notitieveld niet gevonden')
 
-        # 5. Opslaan
+        # 5. Titel nog een keer controleren, dan opslaan
+        if not await zet_titel(ff, bedrijf, controle=True):
+            await screenshot(page, bedrijf['naam']); return False
         knop = await zoek_opslaan(page, ff)
         if not knop:
             log(f'  {bedrijf["naam"]}: FOUT Opslaan knop niet gevonden')
